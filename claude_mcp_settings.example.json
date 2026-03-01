@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "redis-crud-server": {
+      "command": "node",
+      "args": [
+        "./redis-crud-server/build/index.js"
+      ]
+    }
+  }
+}

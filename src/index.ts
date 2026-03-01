@@ -10,6 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createClient, RedisClientType } from 'redis';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import {
   CallToolRequestSchema,
@@ -25,19 +26,73 @@ const __dirname = path.dirname(__filename);
 let redisClient: RedisClientType;
 
 /**
+ * 解析 INI 格式的配置文件
+ */
+function parseIniConfig(filePath: string): Record<string, Record<string, string>> {
+  const config: Record<string, Record<string, string>> = {};
+
+  try {
+    if (!fs.existsSync(filePath)) {
+      return config;
+    }
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    let currentSection = '';
+
+    content.split('\n').forEach(line => {
+      line = line.trim();
+
+      // 跳过空行和注释
+      if (!line || line.startsWith(';') || line.startsWith('#')) {
+        return;
+      }
+
+      // 检查是否是 section 标题
+      const sectionMatch = line.match(/^\[([^\]]+)\]$/);
+      if (sectionMatch) {
+        currentSection = sectionMatch[1];
+        config[currentSection] = {};
+        return;
+      }
+
+      // 解析 key=value
+      const keyValueMatch = line.match(/^([^=]+)=(.*)$/);
+      if (keyValueMatch && currentSection) {
+        const key = keyValueMatch[1].trim();
+        const value = keyValueMatch[2].trim();
+        config[currentSection][key] = value;
+      }
+    });
+  } catch (error) {
+    // 忽略解析错误
+  }
+
+  return config;
+}
+
+/**
  * 获取 Redis 连接配置 - 支持项目级 .env 文件和环境变量
+ * 支持两种格式：
+ * 1. KEY=VALUE 格式（标准 .env）
+ * 2. INI 格式（[REDIS] 或 [DATABASE] section）
  */
 function getRedisConfig() {
   // 优先级 1: 尝试读取 .env 文件
   // 支持通过 ENV_PATH 环境变量指定 .env 文件路径
   const envPath = process.env.ENV_PATH || path.join(__dirname, '..', '.env');
+
+  // 首先尝试解析 INI 格式
+  const iniConfig = parseIniConfig(envPath);
+
+  // 然后加载标准 .env 格式
   dotenv.config({ path: envPath });
 
   // 定义可能的配置名称映射（支持多种命名约定）
   const configNameMappings = {
-    host: ['REDIS_HOST', 'REDIS_SERVER_HOST', 'HOST'],
-    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'PORT'],
-    password: ['REDIS_PASSWORD', 'REDIS_SERVER_PASSWORD', 'PASSWORD']
+    host: ['REDIS_HOST', 'REDIS_SERVER_HOST', 'HOST', 'HOSTNAME', 'REDIS_HOSTNAME'],
+    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'PORT', 'HOSTPORT'],
+    password: ['REDIS_PASSWORD', 'REDIS_SERVER_PASSWORD', 'PASSWORD'],
+    db: ['REDIS_DB', 'SELECT', 'DATABASE_INDEX', 'DB_INDEX']
   };
 
   // 尝试从环境变量中获取配置值
@@ -53,10 +108,32 @@ function getRedisConfig() {
     return undefined;
   }
 
-  // 获取所有配置值
-  const host = getConfigValue('host') || '127.0.0.1';
-  const port = getConfigValue('port') || '6379';
-  const password = getConfigValue('password');
+  // 尝试从 INI 配置中获取值
+  function getIniConfigValue(configKey: string): string | undefined {
+    // 支持 [REDIS] 和 [DATABASE] 两种 section
+    const sections = ['REDIS', 'DATABASE'];
+
+    for (const section of sections) {
+      if (iniConfig[section]) {
+        const possibleNames = configNameMappings[configKey as keyof typeof configNameMappings];
+        if (possibleNames) {
+          for (const name of possibleNames) {
+            if (iniConfig[section][name]) {
+              return iniConfig[section][name];
+            }
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
+  // 获取所有配置值（优先级：环境变量 > INI 配置 > 默认值）
+  const host = getConfigValue('host') || getIniConfigValue('host') || '127.0.0.1';
+  const port = getConfigValue('port') || getIniConfigValue('port') || '6379';
+  const password = getConfigValue('password') || getIniConfigValue('password');
+  const dbStr = getConfigValue('db') || getIniConfigValue('db') || '0';
+  const db = parseInt(dbStr, 10);
 
   // 检查是否有密码被设置
   if (!password) {
@@ -65,19 +142,34 @@ function getRedisConfig() {
       `配置方式（优先级顺序）：\n\n` +
       `1. 项目级 .env 文件（推荐）\n` +
       `   - 在项目根目录创建 .env 文件\n` +
-      `   - 支持的配置名称（任选其一）：\n` +
-      `     • 主机: REDIS_HOST / REDIS_SERVER_HOST / HOST\n` +
-      `     • 端口: REDIS_PORT / REDIS_SERVER_PORT / PORT\n` +
-      `     • 密码: REDIS_PASSWORD / REDIS_SERVER_PASSWORD / PASSWORD\n\n` +
+      `   - 支持两种格式：\n\n` +
+      `   格式一：标准 KEY=VALUE 格式\n` +
+      `   REDIS_HOST=127.0.0.1\n` +
+      `   REDIS_PORT=6379\n` +
+      `   REDIS_PASSWORD=your_password\n` +
+      `   REDIS_DB=0\n\n` +
+      `   格式二：INI 格式（[REDIS] 或 [DATABASE] section）\n` +
+      `   [REDIS]\n` +
+      `   REDIS_HOSTNAME=127.0.0.1\n` +
+      `   PORT=6379\n` +
+      `   REDIS_PASSWORD=your_password\n` +
+      `   SELECT=0\n\n` +
+      `   或\n\n` +
+      `   [DATABASE]\n` +
+      `   HOSTNAME=127.0.0.1\n` +
+      `   HOSTPORT=6379\n` +
+      `   PASSWORD=your_password\n` +
+      `   SELECT=0\n\n` +
+      `   支持的配置名称（任选其一）：\n` +
+      `     • 主机: REDIS_HOST / REDIS_SERVER_HOST / HOST / HOSTNAME / REDIS_HOSTNAME\n` +
+      `     • 端口: REDIS_PORT / REDIS_SERVER_PORT / PORT / HOSTPORT\n` +
+      `     • 密码: REDIS_PASSWORD / REDIS_SERVER_PASSWORD / PASSWORD\n` +
+      `     • 数据库: REDIS_DB / SELECT / DATABASE_INDEX / DB_INDEX (默认: 0)\n\n` +
       `2. 全局 MCP 配置文件\n` +
       `   - 复制项目中的 cline_mcp_settings.example.json 文件\n` +
       `   - 编辑其中的 Redis 配置信息\n` +
       `   - 将配置添加到您的 cline_mcp_settings.json 文件中\n` +
       `   - 配置位置: %APPDATA%\\Code\\User\\globalStorage\\saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json\n\n` +
-      `示例 .env 文件：\n` +
-      `REDIS_HOST=127.0.0.1\n` +
-      `REDIS_PORT=6379\n` +
-      `REDIS_PASSWORD=your_password\n\n` +
       `或者运行 install.cjs 脚本进行自动配置。`
     );
   }
@@ -86,6 +178,7 @@ function getRedisConfig() {
     host,
     port: parseInt(port),
     password,
+    db: isNaN(db) ? 0 : db,
   };
 }
 
@@ -96,13 +189,13 @@ async function initializeRedis() {
   try {
     const config = getRedisConfig();
     redisClient = createClient({
-      url: `redis://:${config.password}@${config.host}:${config.port}`
+      url: `redis://:${config.password}@${config.host}:${config.port}/${config.db}`
     });
 
     redisClient.on('error', (err) => console.error('Redis 连接错误:', err));
 
     await redisClient.connect();
-    console.error('Redis 连接成功');
+    console.error(`Redis 连接成功 (数据库: ${config.db})`);
   } catch (error) {
     console.error('初始化 Redis 连接失败:', error);
     throw error;
