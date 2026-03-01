@@ -19,7 +19,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/redis-crud-server"
+    "url": "https://github.com/Nicolas-One/redis-crud-server"
   },
   "keywords": [
     "redis",
@@ -30,7 +30,7 @@
     "claude-code",
     "model-context-protocol"
   ],
-  "author": "Your Name <your-email@example.com>",
+  "author": "wocaonimabi2025@gmail.com",
   "license": "MIT",
   "engines": {
     "node": ">=16.0.0"
