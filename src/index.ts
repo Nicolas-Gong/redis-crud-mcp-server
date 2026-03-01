@@ -78,8 +78,8 @@ function parseIniConfig(filePath: string): Record<string, Record<string, string>
  */
 function getRedisConfig() {
   // 优先级 1: 尝试读取 .env 文件
-  // 支持通过 ENV_PATH 环境变量指定 .env 文件路径
-  const envPath = process.env.ENV_PATH || path.join(__dirname, '..', '.env');
+  // 优先级顺序：当前工作目录 > ENV_PATH环境变量 > 源代码相对路径
+  const envPath = process.env.ENV_PATH || path.join(process.cwd(), '.env');
 
   // 首先尝试解析 INI 格式
   const iniConfig = parseIniConfig(envPath);
@@ -89,8 +89,8 @@ function getRedisConfig() {
 
   // 定义可能的配置名称映射（支持多种命名约定）
   const configNameMappings = {
-    host: ['REDIS_HOST', 'REDIS_SERVER_HOST', 'HOST', 'HOSTNAME', 'REDIS_HOSTNAME'],
-    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'PORT', 'HOSTPORT'],
+    host: ['REDIS_HOST', 'REDIS_SERVER_HOST', 'REDIS_HOSTNAME', 'HOST', 'HOSTNAME'],
+    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'HOSTPORT', 'PORT'],
     password: ['REDIS_PASSWORD', 'REDIS_SERVER_PASSWORD', 'PASSWORD'],
     db: ['REDIS_DB', 'SELECT', 'DATABASE_INDEX', 'DB_INDEX']
   };
