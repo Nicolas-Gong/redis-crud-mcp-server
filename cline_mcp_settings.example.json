@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "redis-crud-server": {
+      "autoApprove": [
+        "redis_set",
+        "redis_get",
+        "redis_del",
+        "redis_exists",
+        "redis_lpush",
+        "redis_rpush",
+        "redis_lpop",
+        "redis_rpop",
+        "redis_lrange",
+        "redis_llen",
+        "redis_sadd",
+        "redis_srem",
+        "redis_smembers",
+        "redis_sismember",
+        "redis_hset",
+        "redis_hget",
+        "redis_hgetall",
+        "redis_hdel",
+        "redis_zadd",
+        "redis_zrem",
+        "redis_zrange"
+      ],
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "path/to/your/redis-crud-server/build/index.js"
+      ]
+    }
+  }
+}
