@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 
 /**
- * Redis CRUD MCP 服务器
- * 提供用于 Redis 数据库操作的工具：SET、GET、DEL、EXISTS
+ * Redis CRUD MCP 服务器 - 自动检测项目目录版
+ *
+ * 特性：
+ * 1. 自动向上查找 .env 文件定位项目根目录
+ * 2. 支持环境变量 PROJECT_DIR 手动指定
+ * 3. 兼容 Claude Code、Codex 等多种工具
+ * 4. 多项目连接隔离
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createClient, RedisClientType } from 'redis';
+import { createClient } from 'redis';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
@@ -22,1133 +27,194 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Redis 客户端
-let redisClient: RedisClientType;
+// ==================== 项目目录检测 ====================
 
-/**
- * 解析 INI 格式的配置文件
- */
+function findProjectRoot(startDir: string): string {
+  let dir = startDir;
+  for (let i = 0; i < 10; i++) {
+    if (fs.existsSync(path.join(dir, '.env'))) return dir;
+    const parentDir = path.dirname(dir);
+    if (parentDir === dir) break;
+    dir = parentDir;
+  }
+  return startDir;
+}
+
+function getProjectDir(): string {
+  if (process.env.PROJECT_DIR) return process.env.PROJECT_DIR;
+  if (process.env.MCP_PROJECT_DIR) return process.env.MCP_PROJECT_DIR;
+  return findProjectRoot(process.cwd());
+}
+
+// ==================== 连接管理 ====================
+
+const clientCache: Map<string, any> = new Map();
+const OPERATION_TIMEOUT = parseInt(process.env.REDIS_TIMEOUT || '10000'); // 默认 10 秒
+
 function parseIniConfig(filePath: string): Record<string, Record<string, string>> {
   const config: Record<string, Record<string, string>> = {};
-
   try {
-    if (!fs.existsSync(filePath)) {
-      return config;
-    }
-
-    const content = fs.readFileSync(filePath, 'utf-8');
+    if (!fs.existsSync(filePath)) return config;
+    // 统一换行符，支持 Windows (\r\n)、Unix (\n) 和旧 Mac (\r)
+    const content = fs.readFileSync(filePath, 'utf-8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     let currentSection = '';
-
     content.split('\n').forEach(line => {
       line = line.trim();
-
-      // 跳过空行和注释
-      if (!line || line.startsWith(';') || line.startsWith('#')) {
-        return;
-      }
-
-      // 检查是否是 section 标题
+      if (!line || line.startsWith(';') || line.startsWith('#')) return;
       const sectionMatch = line.match(/^\[([^\]]+)\]$/);
-      if (sectionMatch) {
-        currentSection = sectionMatch[1];
-        config[currentSection] = {};
-        return;
-      }
-
-      // 解析 key=value
+      if (sectionMatch) { currentSection = sectionMatch[1]; config[currentSection] = {}; return; }
       const keyValueMatch = line.match(/^([^=]+)=(.*)$/);
-      if (keyValueMatch && currentSection) {
-        const key = keyValueMatch[1].trim();
-        const value = keyValueMatch[2].trim();
-        config[currentSection][key] = value;
-      }
+      if (keyValueMatch && currentSection) config[currentSection][keyValueMatch[1].trim()] = keyValueMatch[2].trim();
     });
-  } catch (error) {
-    // 忽略解析错误
-  }
-
+  } catch (error) {}
   return config;
 }
 
-/**
- * 获取 Redis 连接配置 - 支持项目级 .env 文件和环境变量
- * 支持两种格式：
- * 1. KEY=VALUE 格式（标准 .env）
- * 2. INI 格式（[REDIS] 或 [DATABASE] section）
- */
-function getRedisConfig() {
-  // 优先级 1: 尝试读取 .env 文件
-  // 优先级顺序：当前工作目录 > ENV_PATH环境变量 > 源代码相对路径
-  const envPath = process.env.ENV_PATH || path.join(process.cwd(), '.env');
-
-  // 首先尝试解析 INI 格式
+function getRedisConfig(projectDir: string) {
+  const envPath = path.join(projectDir, '.env');
   const iniConfig = parseIniConfig(envPath);
 
-  // 然后加载标准 .env 格式
-  dotenv.config({ path: envPath });
+  const redisEnvKeys = ['REDIS_HOST', 'REDIS_SERVER_HOST', 'REDIS_HOSTNAME', 'HOST', 'HOSTNAME',
+    'REDIS_PORT', 'REDIS_SERVER_PORT', 'HOSTPORT', 'PORT',
+    'REDIS_PASSWORD', 'REDIS_SERVER_PASSWORD', 'PASSWORD',
+    'REDIS_DB', 'SELECT', 'DATABASE_INDEX', 'DB_INDEX'];
 
-  // 定义可能的配置名称映射（支持多种命名约定）
-  const configNameMappings = {
+  const originalEnv: Record<string, string | undefined> = {};
+  redisEnvKeys.forEach(k => originalEnv[k] = process.env[k]);
+
+  if (fs.existsSync(envPath)) dotenv.config({ path: envPath });
+
+  const mappings: Record<string, string[]> = {
     host: ['REDIS_HOST', 'REDIS_SERVER_HOST', 'REDIS_HOSTNAME', 'HOST', 'HOSTNAME'],
-    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'HOSTPORT', 'PORT'],
+    port: ['REDIS_PORT', 'REDIS_SERVER_PORT', 'PORT'],
     password: ['REDIS_PASSWORD', 'REDIS_SERVER_PASSWORD', 'PASSWORD'],
     db: ['REDIS_DB', 'SELECT', 'DATABASE_INDEX', 'DB_INDEX']
   };
 
-  // 尝试从环境变量中获取配置值
-  function getConfigValue(configKey: string): string | undefined {
-    const possibleNames = configNameMappings[configKey as keyof typeof configNameMappings];
-    if (!possibleNames) return undefined;
-
-    for (const name of possibleNames) {
-      if (process.env[name]) {
-        return process.env[name];
-      }
+  const getEnvValue = (key: string): string | undefined => {
+    const names = mappings[key];
+    if (!names) return undefined;
+    for (const name of names) {
+      if (process.env[name]) return process.env[name];
     }
     return undefined;
-  }
-
-  // 尝试从 INI 配置中获取值
-  function getIniConfigValue(configKey: string): string | undefined {
-    // 支持 [REDIS] 和 [DATABASE] 两种 section
-    const sections = ['REDIS', 'DATABASE'];
-
-    for (const section of sections) {
-      if (iniConfig[section]) {
-        const possibleNames = configNameMappings[configKey as keyof typeof configNameMappings];
-        if (possibleNames) {
-          for (const name of possibleNames) {
-            if (iniConfig[section][name]) {
-              return iniConfig[section][name];
-            }
-          }
-        }
-      }
-    }
-    return undefined;
-  }
-
-  // 获取所有配置值（优先级：环境变量 > INI 配置 > 默认值）
-  const host = getConfigValue('host') || getIniConfigValue('host') || '127.0.0.1';
-  const port = getConfigValue('port') || getIniConfigValue('port') || '6379';
-  const password = getConfigValue('password') || getIniConfigValue('password');
-  const dbStr = getConfigValue('db') || getIniConfigValue('db') || '0';
-  const db = parseInt(dbStr, 10);
-
-  // 检查是否有密码被设置
-  if (!password) {
-    throw new Error(
-      `Redis CRUD MCP 服务器需要配置密码。\n\n` +
-      `配置方式（优先级顺序）：\n\n` +
-      `1. 项目级 .env 文件（推荐）\n` +
-      `   - 在项目根目录创建 .env 文件\n` +
-      `   - 支持两种格式：\n\n` +
-      `   格式一：标准 KEY=VALUE 格式\n` +
-      `   REDIS_HOST=127.0.0.1\n` +
-      `   REDIS_PORT=6379\n` +
-      `   REDIS_PASSWORD=your_password\n` +
-      `   REDIS_DB=0\n\n` +
-      `   格式二：INI 格式（[REDIS] 或 [DATABASE] section）\n` +
-      `   [REDIS]\n` +
-      `   REDIS_HOSTNAME=127.0.0.1\n` +
-      `   PORT=6379\n` +
-      `   REDIS_PASSWORD=your_password\n` +
-      `   SELECT=0\n\n` +
-      `   或\n\n` +
-      `   [DATABASE]\n` +
-      `   HOSTNAME=127.0.0.1\n` +
-      `   HOSTPORT=6379\n` +
-      `   PASSWORD=your_password\n` +
-      `   SELECT=0\n\n` +
-      `   支持的配置名称（任选其一）：\n` +
-      `     • 主机: REDIS_HOST / REDIS_SERVER_HOST / HOST / HOSTNAME / REDIS_HOSTNAME\n` +
-      `     • 端口: REDIS_PORT / REDIS_SERVER_PORT / PORT / HOSTPORT\n` +
-      `     • 密码: REDIS_PASSWORD / REDIS_SERVER_PASSWORD / PASSWORD\n` +
-      `     • 数据库: REDIS_DB / SELECT / DATABASE_INDEX / DB_INDEX (默认: 0)\n\n` +
-      `2. 全局 MCP 配置文件\n` +
-      `   - 复制项目中的 cline_mcp_settings.example.json 文件\n` +
-      `   - 编辑其中的 Redis 配置信息\n` +
-      `   - 将配置添加到您的 cline_mcp_settings.json 文件中\n` +
-      `   - 配置位置: %APPDATA%\\Code\\User\\globalStorage\\saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json\n\n` +
-      `或者运行 install.cjs 脚本进行自动配置。`
-    );
-  }
-
-  return {
-    host,
-    port: parseInt(port),
-    password,
-    db: isNaN(db) ? 0 : db,
   };
+
+  // INI 配置只从 REDIS section 读取，避免与 DATABASE section 混淆
+  const getIniValue = (key: string): string | undefined => {
+    const names = mappings[key];
+    if (!names || !iniConfig.REDIS) return undefined;
+    for (const name of names) {
+      if (iniConfig.REDIS[name]) return iniConfig.REDIS[name];
+    }
+    return undefined;
+  };
+
+  const host = getEnvValue('host') || getIniValue('host') || '127.0.0.1';
+  const port = getEnvValue('port') || getIniValue('port') || '6379';
+  const password = getEnvValue('password') || getIniValue('password');
+  const dbStr = getEnvValue('db') || getIniValue('db') || '0';
+
+  redisEnvKeys.forEach(k => originalEnv[k] === undefined ? delete process.env[k] : process.env[k] = originalEnv[k]);
+
+  if (!password) {
+    throw new Error(`Redis 配置不完整。项目目录: ${projectDir}\n请检查 .env 文件中的 Redis 配置。`);
+  }
+
+  return { host, port: parseInt(port), password, db: parseInt(dbStr) || 0, socket: { connectTimeout: OPERATION_TIMEOUT } };
 }
 
-/**
- * 初始化 Redis 连接
- */
-async function initializeRedis() {
+// 超时包装函数
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
+}
+
+async function getClient(projectDir: string): Promise<any> {
+  if (clientCache.has(projectDir)) return clientCache.get(projectDir)!;
+
+  const config = getRedisConfig(projectDir);
+  const client = createClient({
+    url: `redis://:${config.password}@${config.host}:${config.port}/${config.db}`,
+    socket: { connectTimeout: OPERATION_TIMEOUT }
+  });
+  client.on('error', (err: any) => console.error('Redis 错误:', err));
+
+  // 显式连接并带超时保护
   try {
-    const config = getRedisConfig();
-    redisClient = createClient({
-      url: `redis://:${config.password}@${config.host}:${config.port}/${config.db}`
-    });
-
-    redisClient.on('error', (err) => console.error('Redis 连接错误:', err));
-
-    await redisClient.connect();
-    console.error(`Redis 连接成功 (数据库: ${config.db})`);
+    await withTimeout(client.connect(), OPERATION_TIMEOUT, `Redis 连接超时 (${OPERATION_TIMEOUT}ms)`);
+    console.error(`Redis 连接成功 [${projectDir}] -> ${config.host}:${config.port}/${config.db}`);
   } catch (error) {
-    console.error('初始化 Redis 连接失败:', error);
+    console.error(`Redis 连接失败:`, error);
     throw error;
   }
+
+  clientCache.set(projectDir, client);
+  return client;
 }
 
-/**
- * 验证 Redis 操作参数
- */
-function validateRedisArgs(args: any): args is {
-  key: string;
-  value?: string;
-  field?: string;
-  fields?: string[];
-  values?: string[];
-  members?: string[];
-  member?: string;
-  score?: number;
-  start?: number;
-  stop?: number;
-  min?: number;
-  max?: number;
-} {
-  return (
-    typeof args === 'object' &&
-    args !== null &&
-    typeof args.key === 'string' &&
-    (args.value === undefined || typeof args.value === 'string') &&
-    (args.field === undefined || typeof args.field === 'string') &&
-    (args.fields === undefined || Array.isArray(args.fields)) &&
-    (args.values === undefined || Array.isArray(args.values)) &&
-    (args.members === undefined || Array.isArray(args.members)) &&
-    (args.member === undefined || typeof args.member === 'string') &&
-    (args.score === undefined || typeof args.score === 'number') &&
-    (args.start === undefined || typeof args.start === 'number') &&
-    (args.stop === undefined || typeof args.stop === 'number') &&
-    (args.min === undefined || typeof args.min === 'number') &&
-    (args.max === undefined || typeof args.max === 'number')
-  );
-}
+// ==================== MCP 服务器 ====================
 
-/**
- * 执行 SET 操作
- */
-async function executeSet(key: string, value: string): Promise<string | null> {
-  return await redisClient.set(key, value);
-}
-
-/**
- * 执行 GET 操作
- */
-async function executeGet(key: string): Promise<string | null> {
-  return await redisClient.get(key);
-}
-
-/**
- * 执行 DEL 操作
- */
-async function executeDel(key: string): Promise<number> {
-  return await redisClient.del(key);
-}
-
-/**
- * 执行 EXISTS 操作
- */
-async function executeExists(key: string): Promise<number> {
-  return await redisClient.exists(key);
-}
-
-/**
- * 执行 LPUSH 操作 (列表左侧推入)
- */
-async function executeLPush(key: string, values: string[]): Promise<number> {
-  return await redisClient.lPush(key, values);
-}
-
-/**
- * 执行 RPUSH 操作 (列表右侧推入)
- */
-async function executeRPush(key: string, values: string[]): Promise<number> {
-  return await redisClient.rPush(key, values);
-}
-
-/**
- * 执行 LPOP 操作 (列表左侧弹出)
- */
-async function executeLPop(key: string): Promise<string | null> {
-  return await redisClient.lPop(key);
-}
-
-/**
- * 执行 RPOP 操作 (列表右侧弹出)
- */
-async function executeRPop(key: string): Promise<string | null> {
-  return await redisClient.rPop(key);
-}
-
-/**
- * 执行 LRANGE 操作 (获取列表范围)
- */
-async function executeLRange(key: string, start: number, stop: number): Promise<string[]> {
-  return await redisClient.lRange(key, start, stop);
-}
-
-/**
- * 执行 LLEN 操作 (获取列表长度)
- */
-async function executeLLen(key: string): Promise<number> {
-  return await redisClient.lLen(key);
-}
-
-/**
- * 执行 SADD 操作 (集合添加成员)
- */
-async function executeSAdd(key: string, members: string[]): Promise<number> {
-  return await redisClient.sAdd(key, members);
-}
-
-/**
- * 执行 SREM 操作 (集合移除成员)
- */
-async function executeSRem(key: string, members: string[]): Promise<number> {
-  return await redisClient.sRem(key, members);
-}
-
-/**
- * 执行 SMEMBERS 操作 (获取集合所有成员)
- */
-async function executeSMembers(key: string): Promise<string[]> {
-  return await redisClient.sMembers(key);
-}
-
-/**
- * 执行 SISMEMBER 操作 (检查成员是否在集合中)
- */
-async function executeSIsMember(key: string, member: string): Promise<boolean> {
-  return await redisClient.sIsMember(key, member);
-}
-
-/**
- * 执行 HSET 操作 (哈希设置字段)
- */
-async function executeHSet(key: string, field: string, value: string): Promise<number> {
-  return await redisClient.hSet(key, field, value);
-}
-
-/**
- * 执行 HGET 操作 (哈希获取字段)
- */
-async function executeHGet(key: string, field: string): Promise<string | undefined> {
-  return await redisClient.hGet(key, field);
-}
-
-/**
- * 执行 HGETALL 操作 (获取哈希所有字段和值)
- */
-async function executeHGetAll(key: string): Promise<Record<string, string>> {
-  return await redisClient.hGetAll(key);
-}
-
-/**
- * 执行 HDEL 操作 (哈希删除字段)
- */
-async function executeHDel(key: string, fields: string[]): Promise<number> {
-  return await redisClient.hDel(key, fields);
-}
-
-/**
- * 执行 ZADD 操作 (有序集合添加成员)
- */
-async function executeZAdd(key: string, score: number, member: string): Promise<number> {
-  return await redisClient.zAdd(key, { score, value: member });
-}
-
-/**
- * 执行 ZREM 操作 (有序集合移除成员)
- */
-async function executeZRem(key: string, members: string[]): Promise<number> {
-  return await redisClient.zRem(key, members);
-}
-
-/**
- * 执行 ZRANGE 操作 (有序集合范围查询)
- */
-async function executeZRange(key: string, min: number, max: number): Promise<string[]> {
-  return await redisClient.zRange(key, min, max);
-}
-
-/**
- * 创建带有 Redis CRUD 操作工具的 MCP 服务器
- */
 const server = new Server(
-  {
-    name: "redis-crud-server",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { name: "redis-crud-server", version: "1.3.0" },
+  { capabilities: { tools: {} } }
 );
 
-/**
- * 列出可用 Redis CRUD 工具的处理器
- */
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      // 字符串操作
-      {
-        name: "redis_set",
-        description: "在 Redis 数据库中设置字符串键值对",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "要设置的键"
-            },
-            value: {
-              type: "string",
-              description: "要设置的值"
-            }
-          },
-          required: ["key", "value"]
-        }
-      },
-      {
-        name: "redis_get",
-        description: "从 Redis 数据库中获取字符串键的值",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "要获取的键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      // 通用操作
-      {
-        name: "redis_del",
-        description: "从 Redis 数据库中删除键",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "要删除的键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_exists",
-        description: "检查 Redis 数据库中键是否存在",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "要检查的键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      // 列表操作
-      {
-        name: "redis_lpush",
-        description: "从列表左侧推入元素",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            },
-            values: {
-              type: "array",
-              items: { type: "string" },
-              description: "要推入的值数组"
-            }
-          },
-          required: ["key", "values"]
-        }
-      },
-      {
-        name: "redis_rpush",
-        description: "从列表右侧推入元素",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            },
-            values: {
-              type: "array",
-              items: { type: "string" },
-              description: "要推入的值数组"
-            }
-          },
-          required: ["key", "values"]
-        }
-      },
-      {
-        name: "redis_lpop",
-        description: "从列表左侧弹出元素",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_rpop",
-        description: "从列表右侧弹出元素",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_lrange",
-        description: "获取列表指定范围的元素",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            },
-            start: {
-              type: "number",
-              description: "起始索引",
-              default: 0
-            },
-            stop: {
-              type: "number",
-              description: "结束索引",
-              default: -1
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_llen",
-        description: "获取列表长度",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "列表键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      // 集合操作
-      {
-        name: "redis_sadd",
-        description: "向集合添加成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "集合键"
-            },
-            members: {
-              type: "array",
-              items: { type: "string" },
-              description: "要添加的成员数组"
-            }
-          },
-          required: ["key", "members"]
-        }
-      },
-      {
-        name: "redis_srem",
-        description: "从集合移除成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "集合键"
-            },
-            members: {
-              type: "array",
-              items: { type: "string" },
-              description: "要移除的成员数组"
-            }
-          },
-          required: ["key", "members"]
-        }
-      },
-      {
-        name: "redis_smembers",
-        description: "获取集合的所有成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "集合键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_sismember",
-        description: "检查成员是否在集合中",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "集合键"
-            },
-            member: {
-              type: "string",
-              description: "要检查的成员"
-            }
-          },
-          required: ["key", "member"]
-        }
-      },
-      // 哈希操作
-      {
-        name: "redis_hset",
-        description: "设置哈希字段的值",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "哈希键"
-            },
-            field: {
-              type: "string",
-              description: "字段名"
-            },
-            value: {
-              type: "string",
-              description: "字段值"
-            }
-          },
-          required: ["key", "field", "value"]
-        }
-      },
-      {
-        name: "redis_hget",
-        description: "获取哈希字段的值",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "哈希键"
-            },
-            field: {
-              type: "string",
-              description: "字段名"
-            }
-          },
-          required: ["key", "field"]
-        }
-      },
-      {
-        name: "redis_hgetall",
-        description: "获取哈希的所有字段和值",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "哈希键"
-            }
-          },
-          required: ["key"]
-        }
-      },
-      {
-        name: "redis_hdel",
-        description: "删除哈希字段",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "哈希键"
-            },
-            fields: {
-              type: "array",
-              items: { type: "string" },
-              description: "要删除的字段数组"
-            }
-          },
-          required: ["key", "fields"]
-        }
-      },
-      // 有序集合操作
-      {
-        name: "redis_zadd",
-        description: "向有序集合添加成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "有序集合键"
-            },
-            score: {
-              type: "number",
-              description: "成员分数"
-            },
-            member: {
-              type: "string",
-              description: "成员值"
-            }
-          },
-          required: ["key", "score", "member"]
-        }
-      },
-      {
-        name: "redis_zrem",
-        description: "从有序集合移除成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "有序集合键"
-            },
-            members: {
-              type: "array",
-              items: { type: "string" },
-              description: "要移除的成员数组"
-            }
-          },
-          required: ["key", "members"]
-        }
-      },
-      {
-        name: "redis_zrange",
-        description: "获取有序集合指定分数范围的成员",
-        inputSchema: {
-          type: "object",
-          properties: {
-            key: {
-              type: "string",
-              description: "有序集合键"
-            },
-            min: {
-              type: "number",
-              description: "最小分数",
-              default: "-inf"
-            },
-            max: {
-              type: "number",
-              description: "最大分数",
-              default: "+inf"
-            }
-          },
-          required: ["key"]
-        }
-      }
-    ]
-  };
-});
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    { name: "redis_set", description: "设置键值。自动读取项目 .env 配置连接 Redis。", inputSchema: { type: "object", properties: { key: { type: "string" }, value: { type: "string" } }, required: ["key", "value"] } },
+    { name: "redis_get", description: "获取键值。", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "redis_del", description: "删除键。", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "redis_exists", description: "检查键是否存在。", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "redis_info", description: "获取连接信息。", inputSchema: { type: "object", properties: {} } },
+    { name: "redis_hset", description: "设置哈希字段。", inputSchema: { type: "object", properties: { key: { type: "string" }, field: { type: "string" }, value: { type: "string" } }, required: ["key", "field", "value"] } },
+    { name: "redis_hget", description: "获取哈希字段。", inputSchema: { type: "object", properties: { key: { type: "string" }, field: { type: "string" } }, required: ["key", "field"] } },
+    { name: "redis_hgetall", description: "获取哈希所有字段。", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "redis_hdel", description: "删除哈希字段。", inputSchema: { type: "object", properties: { key: { type: "string" }, fields: { type: "array", items: { type: "string" } } }, required: ["key", "fields"] } }
+  ]
+}));
 
-/**
- * Redis CRUD 工具调用的处理器
- */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (!validateRedisArgs(request.params.arguments)) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      '无效的参数。必需参数：key (字符串)，其他参数根据操作类型而定'
-    );
-  }
-
-  const args = request.params.arguments;
-  const { key } = args;
-
   try {
-    let result: any;
+    const projectDir = getProjectDir();
+    const client = await getClient(projectDir);
+    const args = request.params.arguments as any;
 
-    switch (request.params.name) {
-      // 字符串操作
-      case "redis_set":
-        if (!args.value) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'SET 操作需要提供 value 参数'
-          );
-        }
-        result = await executeSet(key, args.value);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `SET 执行成功。键: ${key}, 值: ${args.value}, 结果: ${result}`
-            }
-          ]
-        };
-
-      case "redis_get":
-        result = await executeGet(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `GET 执行成功。键: ${key}, 值: ${result !== null ? result : 'null'}`
-            }
-          ]
-        };
-
-      // 通用操作
-      case "redis_del":
-        result = await executeDel(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `DEL 执行成功。键: ${key}, 删除的键数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_exists":
-        result = await executeExists(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `EXISTS 执行成功。键: ${key}, 存在: ${result > 0 ? '是' : '否'}`
-            }
-          ]
-        };
-
-      // 列表操作
-      case "redis_lpush":
-        if (!args.values) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'LPUSH 操作需要提供 values 参数'
-          );
-        }
-        result = await executeLPush(key, args.values);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `LPUSH 执行成功。键: ${key}, 添加的元素数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_rpush":
-        if (!args.values) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'RPUSH 操作需要提供 values 参数'
-          );
-        }
-        result = await executeRPush(key, args.values);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `RPUSH 执行成功。键: ${key}, 添加的元素数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_lpop":
-        result = await executeLPop(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `LPOP 执行成功。键: ${key}, 弹出的元素: ${result !== null ? result : 'null'}`
-            }
-          ]
-        };
-
-      case "redis_rpop":
-        result = await executeRPop(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `RPOP 执行成功。键: ${key}, 弹出的元素: ${result !== null ? result : 'null'}`
-            }
-          ]
-        };
-
-      case "redis_lrange":
-        const start = args.start || 0;
-        const stop = args.stop || -1;
-        result = await executeLRange(key, start, stop);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `LRANGE 执行成功。键: ${key}, 范围: [${start}, ${stop}], 结果: [${result.join(', ')}]`
-            }
-          ]
-        };
-
-      case "redis_llen":
-        result = await executeLLen(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `LLEN 执行成功。键: ${key}, 长度: ${result}`
-            }
-          ]
-        };
-
-      // 集合操作
-      case "redis_sadd":
-        if (!args.members) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'SADD 操作需要提供 members 参数'
-          );
-        }
-        result = await executeSAdd(key, args.members);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `SADD 执行成功。键: ${key}, 添加的成员数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_srem":
-        if (!args.members) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'SREM 操作需要提供 members 参数'
-          );
-        }
-        result = await executeSRem(key, args.members);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `SREM 执行成功。键: ${key}, 移除的成员数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_smembers":
-        result = await executeSMembers(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `SMEMBERS 执行成功。键: ${key}, 成员: [${result.join(', ')}]`
-            }
-          ]
-        };
-
-      case "redis_sismember":
-        if (!args.member) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'SISMEMBER 操作需要提供 member 参数'
-          );
-        }
-        result = await executeSIsMember(key, args.member);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `SISMEMBER 执行成功。键: ${key}, 成员: ${args.member}, 是否存在: ${result ? '是' : '否'}`
-            }
-          ]
-        };
-
-      // 哈希操作
-      case "redis_hset":
-        if (!args.field || !args.value) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'HSET 操作需要提供 field 和 value 参数'
-          );
-        }
-        result = await executeHSet(key, args.field, args.value);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `HSET 执行成功。键: ${key}, 字段: ${args.field}, 值: ${args.value}, 结果: ${result}`
-            }
-          ]
-        };
-
-      case "redis_hget":
-        if (!args.field) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'HGET 操作需要提供 field 参数'
-          );
-        }
-        result = await executeHGet(key, args.field);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `HGET 执行成功。键: ${key}, 字段: ${args.field}, 值: ${result !== undefined ? result : 'undefined'}`
-            }
-          ]
-        };
-
-      case "redis_hgetall":
-        result = await executeHGetAll(key);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `HGETALL 执行成功。键: ${key}, 数据: ${JSON.stringify(result)}`
-            }
-          ]
-        };
-
-      case "redis_hdel":
-        if (!args.fields) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'HDEL 操作需要提供 fields 参数'
-          );
-        }
-        result = await executeHDel(key, args.fields);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `HDEL 执行成功。键: ${key}, 删除的字段数量: ${result}`
-            }
-          ]
-        };
-
-      // 有序集合操作
-      case "redis_zadd":
-        if (args.score === undefined || !args.member) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'ZADD 操作需要提供 score 和 member 参数'
-          );
-        }
-        result = await executeZAdd(key, args.score, args.member);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `ZADD 执行成功。键: ${key}, 分数: ${args.score}, 成员: ${args.member}, 结果: ${result}`
-            }
-          ]
-        };
-
-      case "redis_zrem":
-        if (!args.members) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'ZREM 操作需要提供 members 参数'
-          );
-        }
-        result = await executeZRem(key, args.members);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `ZREM 执行成功。键: ${key}, 移除的成员数量: ${result}`
-            }
-          ]
-        };
-
-      case "redis_zrange":
-        const min = args.min || 0;
-        const max = args.max || -1;
-        result = await executeZRange(key, min, max);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `ZRANGE 执行成功。键: ${key}, 范围: [${min}, ${max}], 结果: [${result.join(', ')}]`
-            }
-          ]
-        };
-
-      default:
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `未知工具: ${request.params.name}`
-        );
-    }
-  } catch (error) {
-    console.error(`Redis 操作失败:`, error);
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Redis 操作失败: ${error instanceof Error ? error.message : String(error)}`
-        }
-      ],
-      isError: true
+    const ops: Record<string, () => Promise<string>> = {
+      redis_info: async () => `Redis MCP 信息\n项目目录: ${projectDir}\n连接数: ${clientCache.size}`,
+      redis_set: async () => { const r = await client.set(args.key, args.value); return `SET 成功。键: ${args.key}`; },
+      redis_get: async () => { const r = await client.get(args.key); return `GET 成功。键: ${args.key}, 值: ${r ?? 'null'}`; },
+      redis_del: async () => { const r = await client.del(args.key); return `DEL 成功。删除 ${r} 个键`; },
+      redis_exists: async () => { const r = await client.exists(args.key); return `EXISTS 成功。键 ${args.key} ${r > 0 ? '存在' : '不存在'}`; },
+      redis_hset: async () => { await client.hSet(args.key, args.field, args.value); return `HSET 成功。${args.key}.${args.field} = ${args.value}`; },
+      redis_hget: async () => { const r = await client.hGet(args.key, args.field); return `HGET 成功。${args.key}.${args.field} = ${r ?? 'null'}`; },
+      redis_hgetall: async () => { const r = await client.hGetAll(args.key); return `HGETALL 成功。${args.key}: ${JSON.stringify(r)}`; },
+      redis_hdel: async () => { const r = await client.hDel(args.key, args.fields); return `HDEL 成功。删除 ${r} 个字段`; }
     };
+
+    if (!ops[request.params.name]) throw new McpError(ErrorCode.MethodNotFound, `未知工具: ${request.params.name}`);
+    return { content: [{ type: "text", text: await ops[request.params.name]() }] };
+  } catch (error) {
+    // 连接错误时清除缓存，下次请求重新创建连接
+    const projectDir = getProjectDir();
+    if (clientCache.has(projectDir)) {
+      const client = clientCache.get(projectDir)!;
+      clientCache.delete(projectDir);
+      client.quit().catch(() => {});
+    }
+    return { content: [{ type: "text", text: `操作失败: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
   }
 });
 
-/**
- * 使用 stdio 传输启动服务器
- */
 async function main() {
-  try {
-    await initializeRedis();
+  const projectDir = getProjectDir();
+  console.error(`Redis CRUD MCP 启动`);
+  console.error(`项目目录: ${projectDir}`);
 
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error('Redis CRUD MCP 服务器正在 stdio 上运行');
-  } catch (error) {
-    console.error('启动服务器失败:', error);
-    process.exit(1);
-  }
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
 }
 
-main().catch((error) => {
-  console.error("服务器错误:", error);
-  process.exit(1);
-});
+main().catch(console.error);
